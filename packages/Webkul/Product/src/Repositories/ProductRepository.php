@@ -5,6 +5,7 @@ namespace Webkul\Product\Repositories;
 use Exception;
 use Illuminate\Support\Str;
 use Illuminate\Support\Facades\DB;
+use Webkul\Checkout\Facades\Cart;
 use Webkul\Product\Models\Product;
 use Illuminate\Pagination\Paginator;
 use Webkul\Core\Eloquent\Repository;
@@ -111,7 +112,7 @@ class ProductRepository extends Repository
         Event::dispatch('catalog.product.delete.after', $id);
     }
 
-     /**
+    /**
      * @param int $categoryId
      *
      * @return \Illuminate\Support\Collection
@@ -147,7 +148,19 @@ class ProductRepository extends Repository
 
         $page = Paginator::resolveCurrentPage('page');
 
-        $repository = app(ProductFlatRepository::class)->scopeQuery(function ($query) use ($params, $categoryId) {
+        $customerGroupId = null;
+
+        if (Cart::getCurrentCustomer()->check()) {
+            $customerGroupId = Cart::getCurrentCustomer()->user()->customer_group_id;
+        } else {
+            $customerGroupRepository = app('Webkul\Customer\Repositories\CustomerGroupRepository');
+
+            if ($customerGuestGroup = $customerGroupRepository->findOneByField('code', 'guest')) {
+                $customerGroupId = $customerGuestGroup->id;
+            }
+        }
+
+        $repository = app(ProductFlatRepository::class)->scopeQuery(function ($query) use ($params, $categoryId, $customerGroupId) {
             $channel = request()->get('channel') ?: (core()->getCurrentChannelCode() ?: core()->getDefaultChannelCode());
 
             $locale = request()->get('locale') ?: app()->getLocale();
@@ -156,8 +169,38 @@ class ProductRepository extends Repository
                 ->select('product_flat.*')
                 ->join('product_flat as variants', 'product_flat.id', '=', DB::raw('COALESCE(' . DB::getTablePrefix() . 'variants.parent_id, ' . DB::getTablePrefix() . 'variants.id)'))
                 ->leftJoin('product_categories', 'product_categories.product_id', '=', 'product_flat.product_id')
-                ->leftJoin('product_attribute_values', 'product_attribute_values.product_id', '=', 'variants.product_id')
-                ->where('product_flat.channel', $channel)
+                ->leftJoin('product_attribute_values', 'product_attribute_values.product_id', '=', 'variants.product_id');
+
+            if ($customerGroupId) {
+                $qb->addSelect(DB::raw(
+                    "IF(product_customer_group_prices.value OR catalog_rule_product_prices.price,
+                            IF(product_customer_group_prices.value <= catalog_rule_product_prices.price,
+                                product_customer_group_prices.value,
+                                catalog_rule_product_prices.price
+                            ),
+                            variants.min_price
+                        ) AS customer_group_product_price"
+                ));
+
+                $qb->leftJoin('catalog_rule_product_prices', function($join) use ($customerGroupId) {
+                    $join->whereColumn('catalog_rule_product_prices.product_id', 'variants.product_id');
+                    $join->where(function($join2) use ($customerGroupId) {
+                        $join2->where('catalog_rule_product_prices.customer_group_id', $customerGroupId)
+                            ->orWhereNull('catalog_rule_product_prices.customer_group_id');
+                    });
+                });
+
+                $qb->leftJoin('product_customer_group_prices', function($join) use ($customerGroupId) {
+                    $join->where('product_customer_group_prices.qty', '=', 1);
+                    $join->whereColumn('product_customer_group_prices.product_id', 'variants.product_id');
+                    $join->where(function($join2) use ($customerGroupId) {
+                        $join2->where('product_customer_group_prices.customer_group_id', $customerGroupId)
+                            ->orWhereNull('product_customer_group_prices.customer_group_id');
+                    });
+                });
+            }
+
+            $qb ->where('product_flat.channel', $channel)
                 ->where('product_flat.locale', $locale)
                 ->whereNotNull('product_flat.url_key');
 
@@ -208,8 +251,17 @@ class ProductRepository extends Repository
             if ($priceFilter = request('price')) {
                 $priceRange = explode(',', $priceFilter);
                 if (count($priceRange) > 0) {
-                    $qb->where('variants.min_price', '>=', core()->convertToBasePrice($priceRange[0]));
-                    $qb->where('variants.min_price', '<=', core()->convertToBasePrice(end($priceRange)));
+                    $priceMin = core()->convertToBasePrice($priceRange[0]);
+                    $priceMax = core()->convertToBasePrice(end($priceRange));
+                    $qb->whereRaw(
+                        "IF(product_customer_group_prices.value OR catalog_rule_product_prices.price,
+                            IF(product_customer_group_prices.value <= catalog_rule_product_prices.price,
+                                (product_customer_group_prices.value >= ". (float)$priceMin . " AND product_customer_group_prices.value <= ". (float)$priceMax . "),
+                                (catalog_rule_product_prices.price >= ". (float)$priceMin . " AND catalog_rule_product_prices.price <= ". (float)$priceMax . ")
+                            ),
+                            (variants.min_price >= ". (float)$priceMin . " AND variants.min_price <= ". (float)$priceMax . ")
+                        )"
+                    );
                 }
             }
 
